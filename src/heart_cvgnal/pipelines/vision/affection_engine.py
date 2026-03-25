@@ -6,17 +6,25 @@ Rule-based evaluation of four psychologically-grounded signals.
   Signal              | Direction | Trigger
   --------------------|-----------|--------------------------------------------
   Duchenne Smile      | +5 pts    | mouth_ratio spikes AND eye_ratio drops
-  Leaning In          | +2 pts/s  | shoulder_ratio > 1.15 × baseline
-  Synchrony           | +1.5 pts/s| sustained head tilt (5-25°) OR nodding
-  Barrier Signal      | -3 pts/s  | both wrists cross opposite shoulders > 3 s
+  Leaning In          | +4 pts    | shoulder_ratio > 1.15 × baseline (≥50% of window)
+  Synchrony           | +3 pts    | sustained head tilt (5-25°, ≥30% of window)
+  Nodding             | +2 pts    | high nose-y variance across window
+  Barrier Signal      | -5 pts    | both wrists crossed ≥50% of window
+
+Scoring runs in TWO phases:
+  1. Per-frame  — used ONLY during the 3-second calibration phase (``update()``)
+  2. Per-window — called by the runner every 5 s after calibration (``batch_evaluate()``)
 
 Global score initialises at 50 and is clamped to [0, 100].
 
 Usage
 -----
     engine = AffectionEngine()
-    ...
-    output = engine.update(frame_features, timestamp_seconds)
+    # calibration (call every frame until output.calibrated is True)
+    output = engine.update(frame_features, ts)
+
+    # evaluation (call every EVAL_WINDOW seconds with the buffered list)
+    output = engine.batch_evaluate(buffered_features, window_elapsed_secs, ts)
 """
 
 from __future__ import annotations
@@ -31,12 +39,12 @@ from .feature_extractor import FrameFeatures
 
 
 # ---------------------------------------------------------------------------
-# Output data model (consumed by the runner / UI layer)
+# Output data model
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AffectionOutput:
-    """Snapshot of the engine's state returned after each frame update."""
+    """Snapshot of the engine's state returned after each update."""
 
     score: float
     """Current affection score, always in [0, 100]."""
@@ -46,27 +54,22 @@ class AffectionOutput:
     calib_progress: float
     """Fraction of the calibration window elapsed, 0.0 → 1.0."""
 
-    # ── Baselines (published so UI can show deltas) ───────────────────
+    # ── Baselines (published so the UI can show deltas) ──────────────
     baseline_mouth:    float
     baseline_eye:      float
     baseline_shoulder: float
 
-    # ── Active-signal flags ───────────────────────────────────────────
+    # ── Active-signal flags (updated every batch window) ─────────────
     is_leaning:  bool
-    """Subject is currently leaning in."""
     is_barrier:  bool
-    """Barrier signal is actively penalising (3-second threshold exceeded)."""
     is_syncing:  bool
-    """Synchrony (head tilt or nodding) is contributing to score."""
 
-    # ── Event notification ────────────────────────────────────────────
+    # ── Event notification (drives the popup banner) ──────────────────
     last_event_text: str
     last_event_time: float
-    """Wall-clock timestamp of the most recent event (for fade-out calc)."""
 
-    # ── Recent event log ──────────────────────────────────────────────
+    # ── Rolling event log ─────────────────────────────────────────────
     event_log: List[str]
-    """Rolling list of the last N event strings (newest first)."""
 
 
 # ---------------------------------------------------------------------------
@@ -75,34 +78,38 @@ class AffectionOutput:
 
 class AffectionEngine:
     """
-    Stateful rule-based affection scorer.
+    Stateful affection scorer.
 
-    Maintain one instance per session and call ``update()`` on every frame.
+    * Call ``update()`` every frame **during calibration only**.
+    * Call ``batch_evaluate()`` every EVAL_WINDOW seconds **after calibration**.
     """
 
     # ── Calibration ──────────────────────────────────────────────────────
     CALIB_SECS: float = 3.0
 
     # ── Rule 1: Duchenne Smile ────────────────────────────────────────────
-    MOUTH_SPIKE_FACTOR: float = 1.12   # mouth must be ≥12 % wider than baseline
-    EYE_SQUINT_FACTOR:  float = 0.90   # eyes must be ≤10 % narrower than baseline
+    MOUTH_SPIKE_FACTOR: float = 1.12
+    EYE_SQUINT_FACTOR:  float = 0.90
     DUCHENNE_DELTA:     float = 5.0
-    DUCHENNE_COOLDOWN:  float = 2.5    # seconds between awards
+    DUCHENNE_COOLDOWN:  float = 2.5   # seconds between awards
+    DUCHENNE_THRESHOLD: float = 0.25  # min fraction of face-frames showing smile
 
     # ── Rule 2: Leaning In ───────────────────────────────────────────────
-    LEAN_FACTOR:        float = 1.15   # 15 % wider shoulders than baseline
-    LEAN_DELTA_PER_SEC: float = 2.0
+    LEAN_FACTOR:      float = 1.15
+    LEAN_PTS:         float = 4.0    # awarded when ≥50 % of pose-frames lean
+    LEAN_THRESHOLD:   float = 0.50
 
     # ── Rule 3: Synchrony ────────────────────────────────────────────────
-    SYNC_TILT_MIN_DEG:  float = 5.0    # degrees
-    SYNC_TILT_MAX_DEG:  float = 25.0   # degrees
-    SYNC_TILT_WARMUP:   float = 2.0    # seconds sustained before awarding
-    SYNC_DELTA_PER_SEC: float = 1.5
-    NODDING_STD:        float = 0.007  # nose-y std threshold (2-sec window)
+    SYNC_TILT_MIN_DEG:  float = 5.0
+    SYNC_TILT_MAX_DEG:  float = 25.0
+    SYNC_PTS:           float = 3.0   # awarded when ≥30 % of face-frames tilt
+    SYNC_THRESHOLD:     float = 0.30
+    NOD_PTS:            float = 2.0   # awarded for detected nodding
+    NODDING_STD:        float = 0.007
 
     # ── Rule 4: Barrier Signal ───────────────────────────────────────────
-    BARRIER_WAIT_SECS:    float = 3.0
-    BARRIER_DELTA_PER_SEC: float = -3.0
+    BARRIER_THRESHOLD:  float = 0.50   # min fraction of pose-frames crossed
+    BARRIER_PTS:        float = 5.0    # deducted when threshold met
 
     # ── Score bounds ─────────────────────────────────────────────────────
     SCORE_MIN: float = 0.0
@@ -110,7 +117,6 @@ class AffectionEngine:
 
     # ── Misc ─────────────────────────────────────────────────────────────
     EVENT_LOG_SIZE: int = 8
-    _FPS: float = 30.0   # assumed frame-rate for per-frame delta conversion
 
     def __init__(self) -> None:
         # ── Calibration state ────────────────────────────────────────────
@@ -125,21 +131,11 @@ class AffectionEngine:
         # ── Score ────────────────────────────────────────────────────────
         self._score: float = 50.0
 
-        # ── Rule-1 (Duchenne) ────────────────────────────────────────────
+        # ── Per-batch signal state (updated by batch_evaluate) ───────────
         self._duchenne_last: float = 0.0
-
-        # ── Rule-2 (Lean-in) ─────────────────────────────────────────────
-        self._was_leaning: bool = False
-
-        # ── Rule-3 (Synchrony) ───────────────────────────────────────────
-        self._sync_tilt_start: Optional[float] = None
-        self._nose_y_buf: deque[float] = deque(maxlen=int(self._FPS * 2))  # 2-sec
-        self._is_syncing: bool = False
-
-        # ── Rule-4 (Barrier) ─────────────────────────────────────────────
-        self._barrier_start:   Optional[float] = None
-        self._barrier_alerted: bool = False
-        self._is_barrier:      bool = False
+        self._was_leaning:   bool  = False
+        self._is_syncing:    bool  = False
+        self._is_barrier:    bool  = False
 
         # ── Events ───────────────────────────────────────────────────────
         self._last_event_text: str   = ""
@@ -147,43 +143,136 @@ class AffectionEngine:
         self._event_log: deque[str]  = deque(maxlen=self.EVENT_LOG_SIZE)
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — calibration phase (call every frame)
     # ------------------------------------------------------------------
 
     def update(self, features: FrameFeatures, ts: float) -> AffectionOutput:
         """
-        Process one frame of features and return the current engine state.
-
-        Args:
-            features : FrameFeatures from FeatureExtractor.extract()
-            ts       : current wall-clock time (``time.monotonic()`` recommended)
-        Returns:
-            AffectionOutput snapshot
+        Process one frame during the calibration phase.
+        After ``output.calibrated`` is True the runner should switch to
+        ``batch_evaluate()`` and stop calling this method.
         """
         if self._start_time is None:
             self._start_time = ts
 
-        # ── Calibration phase ─────────────────────────────────────────────
         if not self._calibrated:
             self._calibrate(features, ts)
+
+        return self._build_output(ts)
+
+    # ------------------------------------------------------------------
+    # Public API — evaluation phase (call every EVAL_WINDOW seconds)
+    # ------------------------------------------------------------------
+
+    def batch_evaluate(
+        self,
+        features_list: list[FrameFeatures],
+        window_elapsed: float,
+        ts: float,
+    ) -> AffectionOutput:
+        """
+        One-shot evaluation of features buffered over a time window.
+
+        Args:
+            features_list   : FrameFeatures accumulated since the last call.
+            window_elapsed  : Actual duration of the window in seconds.
+            ts              : Current ``time.monotonic()`` timestamp.
+
+        Returns:
+            AffectionOutput snapshot with the updated score.
+        """
+        if not self._calibrated or not features_list:
             return self._build_output(ts)
 
-        # ── Evaluation phase ──────────────────────────────────────────────
-        if features.face_detected:
-            self._rule_duchenne(features, ts)
-            self._rule_synchrony(features, ts)
+        face_frames = [f for f in features_list if f.face_detected]
+        pose_frames = [f for f in features_list if f.pose_detected]
+        n_face = len(face_frames)
+        n_pose = len(pose_frames)
 
-        if features.pose_detected:
-            self._rule_lean_in(features, ts)
-            self._rule_barrier(features, ts)
+        # Collect (delta, banner_text) for each triggered rule
+        pos_events: list[tuple[float, str]] = []
+        neg_events: list[tuple[float, str]] = []
+
+        # ── Rule 1: Duchenne Smile ─────────────────────────────────────
+        if n_face > 0 and (ts - self._duchenne_last) >= self.DUCHENNE_COOLDOWN:
+            duchenne_n = sum(
+                1 for f in face_frames
+                if (f.mouth_ratio > self._baseline_mouth * self.MOUTH_SPIKE_FACTOR
+                    and f.eye_ratio  < self._baseline_eye  * self.EYE_SQUINT_FACTOR)
+            )
+            if duchenne_n / n_face >= self.DUCHENNE_THRESHOLD:
+                d = self.DUCHENNE_DELTA
+                self._score += d
+                self._duchenne_last = ts
+                pos_events.append((d, f"+{int(d)} pts! Genuine Smile!"))
+
+        # ── Rule 2: Leaning In ────────────────────────────────────────
+        if n_pose > 0:
+            lean_n = sum(
+                1 for f in pose_frames
+                if f.shoulder_ratio > self._baseline_shoulder * self.LEAN_FACTOR
+            )
+            lean_ratio = lean_n / n_pose
+            self._was_leaning = lean_ratio >= self.LEAN_THRESHOLD
+            if self._was_leaning:
+                d = self.LEAN_PTS
+                self._score += d
+                pos_events.append((d, f"+{int(d)} pts! Leaning In!"))
         else:
-            # Skeleton lost — reset pose-dependent timers
-            self._barrier_start  = None
-            self._is_barrier     = False
-            self._was_leaning    = False
+            self._was_leaning = False
 
-        # Clamp score
+        # ── Rule 3: Synchrony (head tilt OR nodding) ──────────────────
+        if n_face > 0:
+            tilt_n = sum(
+                1 for f in face_frames
+                if self.SYNC_TILT_MIN_DEG <= abs(f.roll_angle_deg) <= self.SYNC_TILT_MAX_DEG
+            )
+            tilt_ratio = tilt_n / n_face
+            nose_ys    = [f.nose_y for f in face_frames]
+            nodding    = (
+                len(nose_ys) > 5
+                and float(np.std(nose_ys)) > self.NODDING_STD
+            )
+            self._is_syncing = tilt_ratio >= self.SYNC_THRESHOLD or nodding
+
+            if tilt_ratio >= self.SYNC_THRESHOLD:
+                d = self.SYNC_PTS
+                self._score += d
+                pos_events.append((d, f"+{int(d)} pts! Great Eye Contact!"))
+            elif nodding:
+                d = self.NOD_PTS
+                self._score += d
+                pos_events.append((d, f"+{int(d)} pts! Nodding Along!"))
+        else:
+            self._is_syncing = False
+
+        # ── Rule 4: Barrier Signal ────────────────────────────────────
+        if n_pose > 0:
+            barrier_n     = sum(1 for f in pose_frames if f.wrists_crossed)
+            barrier_ratio = barrier_n / n_pose
+            self._is_barrier = barrier_ratio >= self.BARRIER_THRESHOLD
+            if self._is_barrier:
+                d = self.BARRIER_PTS
+                self._score -= d
+                neg_events.append((d, f"-{int(d)} pts! Barrier Signal!"))
+        else:
+            self._is_barrier = False
+
+        # ── Clamp score ───────────────────────────────────────────────
         self._score = max(self.SCORE_MIN, min(self.SCORE_MAX, self._score))
+
+        # ── Log all events; set banner to most impactful positive ─────
+        all_text = [t for _, t in pos_events] + [t for _, t in neg_events]
+        for text in all_text:
+            self._event_log.appendleft(text)
+
+        if pos_events:
+            best_text = max(pos_events, key=lambda x: x[0])[1]
+            self._last_event_text = best_text
+            self._last_event_time = ts
+        elif neg_events:
+            self._last_event_text = neg_events[0][1]
+            self._last_event_time = ts
 
         return self._build_output(ts)
 
@@ -202,119 +291,15 @@ class AffectionEngine:
                 self._baseline_mouth    = float(np.mean([f.mouth_ratio    for f in buf]))
                 self._baseline_eye      = float(np.mean([f.eye_ratio      for f in buf]))
                 self._baseline_shoulder = float(np.mean([f.shoulder_ratio for f in buf]))
-            # If nothing was captured (no face/pose during entire window),
-            # keep the hardcoded sensible defaults.
             self._calibrated = True
             self._calib_buf.clear()
-            self._fire_event("Baseline locked — go!", ts)
-
-    # ------------------------------------------------------------------
-    # Rule 1 — Duchenne Smile
-    # ------------------------------------------------------------------
-
-    def _rule_duchenne(self, features: FrameFeatures, ts: float) -> None:
-        """
-        Award +5 when mouth widens AND eyes narrow simultaneously.
-        The combination of a wide smile (zygomaticus major) + eyelid squint
-        (orbicularis oculi) is the hallmark of a genuine (Duchenne) smile.
-        """
-        mouth_up   = features.mouth_ratio > self._baseline_mouth * self.MOUTH_SPIKE_FACTOR
-        eyes_squint = features.eye_ratio  < self._baseline_eye   * self.EYE_SQUINT_FACTOR
-
-        if mouth_up and eyes_squint:
-            if ts - self._duchenne_last >= self.DUCHENNE_COOLDOWN:
-                self._score          += self.DUCHENNE_DELTA
-                self._duchenne_last   = ts
-                self._fire_event("Duchenne Smile!  +5", ts)
-
-    # ------------------------------------------------------------------
-    # Rule 2 — Leaning In
-    # ------------------------------------------------------------------
-
-    def _rule_lean_in(self, features: FrameFeatures, ts: float) -> None:
-        """
-        Award +2 pts/s while the subject's shoulders span > 1.15× baseline.
-        In normalised coordinates a wider shoulder span means the subject has
-        moved physically closer to the camera — a classic approach signal.
-        """
-        leaning = features.shoulder_ratio > self._baseline_shoulder * self.LEAN_FACTOR
-
-        if leaning:
-            self._score += self.LEAN_DELTA_PER_SEC / self._FPS
-            if not self._was_leaning:
-                self._fire_event("Leaning In!  +2/s", ts)
-        self._was_leaning = leaning
-
-    # ------------------------------------------------------------------
-    # Rule 3 — Synchrony
-    # ------------------------------------------------------------------
-
-    def _rule_synchrony(self, features: FrameFeatures, ts: float) -> None:
-        """
-        Award +1.5 pts/s for either:
-          a) Sustained optimal head tilt (roll angle 5–25°)  — engaged listening
-          b) Head nodding detected via high nose-y variance over 2 seconds
-        """
-        roll = abs(features.roll_angle_deg)
-        tilt_ok = self.SYNC_TILT_MIN_DEG <= roll <= self.SYNC_TILT_MAX_DEG
-
-        # (a) Tilt-based synchrony — requires 2-second warm-up
-        if tilt_ok:
-            if self._sync_tilt_start is None:
-                self._sync_tilt_start = ts
-            sustained = (ts - self._sync_tilt_start) >= self.SYNC_TILT_WARMUP
-        else:
-            self._sync_tilt_start = None
-            sustained = False
-
-        # (b) Nodding — nose-y variance over last 2 seconds
-        self._nose_y_buf.append(features.nose_y)
-        nodding = (
-            len(self._nose_y_buf) == self._nose_y_buf.maxlen
-            and float(np.std(self._nose_y_buf)) > self.NODDING_STD
-        )
-
-        active = sustained or nodding
-        if active:
-            self._score += self.SYNC_DELTA_PER_SEC / self._FPS
-        self._is_syncing = active
-
-    # ------------------------------------------------------------------
-    # Rule 4 — Barrier Signal
-    # ------------------------------------------------------------------
-
-    def _rule_barrier(self, features: FrameFeatures, ts: float) -> None:
-        """
-        Penalise -3 pts/s after both wrists have remained crossed over the
-        opposite shoulders for more than 3 seconds (defensive arm-cross).
-        """
-        if features.wrists_crossed:
-            if self._barrier_start is None:
-                self._barrier_start   = ts
-                self._barrier_alerted = False
-
-            elapsed = ts - self._barrier_start
-            if elapsed >= self.BARRIER_WAIT_SECS:
-                self._score      += self.BARRIER_DELTA_PER_SEC / self._FPS
-                self._is_barrier  = True
-                if not self._barrier_alerted:
-                    self._fire_event("Barrier Signal!  -3/s", ts)
-                    self._barrier_alerted = True
-            else:
-                self._is_barrier = False
-        else:
-            self._barrier_start   = None
-            self._barrier_alerted = False
-            self._is_barrier      = False
+            self._last_event_text = "Baseline locked — go!"
+            self._last_event_time = ts
+            self._event_log.appendleft("Baseline locked — go!")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _fire_event(self, text: str, ts: float) -> None:
-        self._last_event_text = text
-        self._last_event_time = ts
-        self._event_log.appendleft(text)
 
     def _build_output(self, ts: float) -> AffectionOutput:
         calib_progress = 0.0

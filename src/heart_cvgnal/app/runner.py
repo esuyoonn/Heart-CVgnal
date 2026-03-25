@@ -1,16 +1,16 @@
 """
-Heart CV-gnal — Main Application Runner
-=========================================
-Orchestrates the real-time webcam loop, MediaPipe Holistic inference,
-feature extraction, affection scoring, and overlay rendering.
+Heart CV-gnal — Main Application Runner  (Demo Edition)
+=========================================================
+Pink romantic theme · 5-second evaluation windows · 5-minute demo timer.
+
+Controls
+--------
+Q / ESC      — quit at any time
+Any key      — close the final result screen
 
 Run via::
 
     PYTHONPATH=src python apps/run_heart_cvgnal.py
-
-Controls
---------
-Q / ESC — quit
 """
 
 from __future__ import annotations
@@ -26,23 +26,32 @@ from ..pipelines.vision.affection_engine import AffectionEngine, AffectionOutput
 from ..pipelines.vision.feature_extractor import FeatureExtractor, FrameFeatures
 
 # ---------------------------------------------------------------------------
-# UI constants
+# Demo configuration
 # ---------------------------------------------------------------------------
-_PANEL_W   = 250          # right-side score panel width (px)
-_PANEL_PAD = 10           # outer margin
+_DEMO_DURATION    = 300.0   # 5 minutes (seconds)
+_EVAL_WINDOW      = 5.0     # scoring window size (seconds)
+_EVENT_DISPLAY    = 4.0     # how long the popup banner stays on screen
 
-_EVENT_DISPLAY_SECS = 2.5  # how long an event banner stays visible
+# ---------------------------------------------------------------------------
+# Layout
+# ---------------------------------------------------------------------------
+_PANEL_W   = 260   # right-side score panel width (px)
+_PANEL_PAD = 10    # outer margin
 
-# Score-band colour stops (BGR)  — maps score 0→100 to blue→green→red
-_COLOUR_STOPS = [
-    (0,   (200,  70,  30)),   # 0   — cool blue
-    (40,  ( 60, 200,  80)),   # 40  — lime green
-    (65,  ( 30, 210, 200)),   # 65  — amber
-    (85,  ( 30,  80, 240)),   # 85  — orange-red
-    (100, ( 20,  30, 255)),   # 100 — hot red
-]
+# ---------------------------------------------------------------------------
+# Pink Romantic Colour Palette  (OpenCV BGR)
+# ---------------------------------------------------------------------------
+_PINK_LIGHT  = (203, 192, 255)   # soft pastel pink
+_PINK_HOT    = (147,  20, 255)   # deep magenta / hot pink
+_PINK_MED    = (180, 105, 255)   # medium lavender-pink
+_PINK_PANEL  = ( 40,  15,  50)   # very dark aubergine  (panel bg)
+_PINK_BORDER = (160,  80, 200)   # medium purple-pink   (borders)
+_WHITE       = (255, 255, 255)
+_GRAY_DIM    = ( 80,  70,  90)
 
-# Mood labels for the score
+# ---------------------------------------------------------------------------
+# Mood labels
+# ---------------------------------------------------------------------------
 _MOOD_LABELS = [
     (0,  "Not Feeling It"),
     (20, "Mildly Curious"),
@@ -51,21 +60,6 @@ _MOOD_LABELS = [
     (75, "Smitten"),
     (88, "Head Over Heels"),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Helper: score → BGR colour (linear interpolation between stops)
-# ---------------------------------------------------------------------------
-
-def _score_color(score: float) -> tuple[int, int, int]:
-    score = max(0.0, min(100.0, score))
-    for i in range(len(_COLOUR_STOPS) - 1):
-        s0, c0 = _COLOUR_STOPS[i]
-        s1, c1 = _COLOUR_STOPS[i + 1]
-        if s0 <= score <= s1:
-            t = (score - s0) / (s1 - s0)
-            return tuple(int(c0[j] + t * (c1[j] - c0[j])) for j in range(3))  # type: ignore[return-value]
-    return _COLOUR_STOPS[-1][1]
 
 
 def _mood_label(score: float) -> str:
@@ -77,12 +71,22 @@ def _mood_label(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Application class
+# Application
 # ---------------------------------------------------------------------------
 
 class HeartCVgnalApp:
     """
     Top-level application.  Instantiate once; call ``run()`` to start.
+
+    Architecture
+    ------------
+    * Calibration phase  (first ~3 s): ``engine.update()`` called every frame.
+    * Evaluation phase   (remaining demo time):
+        - Features are buffered in ``_feature_buf``.
+        - Every ``_EVAL_WINDOW`` seconds → ``engine.batch_evaluate()`` is called
+          exactly ONCE, score is updated, popup fires.
+        - The cached ``_last_output`` is used for display between evaluations
+          (prevents per-frame flicker).
     """
 
     def __init__(self, camera_index: int = 0) -> None:
@@ -90,9 +94,8 @@ class HeartCVgnalApp:
         if not self._cap.isOpened():
             raise RuntimeError(
                 f"Cannot open camera index {camera_index}.  "
-                "Check macOS System Settings → Privacy & Security → Camera."
+                "Check System Settings → Privacy & Security → Camera."
             )
-
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
 
@@ -102,14 +105,22 @@ class HeartCVgnalApp:
         self._mp_holistic = mp.solutions.holistic
         self._mp_drawing  = mp.solutions.drawing_utils
 
+        # ── Demo / windowing state (all wall-clock via time.time()) ─────
+        self._demo_start:     Optional[float]          = None
+        self._window_start:   Optional[float]          = None
+        self._feature_buf:    list[FrameFeatures]       = []
+        self._last_output:    Optional[AffectionOutput] = None
+        self._was_calibrated: bool                      = False
+        self._last_frame:     Optional[np.ndarray]      = None
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        print("=" * 55)
-        print("  Heart CV-gnal  |  Press Q or ESC to quit")
-        print("=" * 55)
+        print("=" * 58)
+        print("  Heart CV-gnal  ♥  Press Q or ESC to quit")
+        print("=" * 58)
 
         holistic_cfg = dict(
             min_detection_confidence=0.5,
@@ -123,35 +134,79 @@ class HeartCVgnalApp:
                     print("[WARN] Frame read failed — retrying …")
                     continue
 
-                # Mirror horizontally for natural selfie view.
-                # MediaPipe processes this flipped frame, so its left/right
-                # labels align with the displayed image.
+                # Mirror for natural selfie view
                 frame = cv2.flip(frame, 1)
+                now = time.time()
+                ts  = time.monotonic()   # monotonic for engine internals
 
-                # ── Inference ─────────────────────────────────────────────
+                # ── MediaPipe inference ───────────────────────────────────
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
                 results = holistic.process(rgb)
                 rgb.flags.writeable = True
 
-                # ── Feature extraction ─────────────────────────────────────
+                # ── Feature extraction ────────────────────────────────────
                 features = self._extractor.extract(results)
 
-                # ── Score update ──────────────────────────────────────────
-                ts     = time.monotonic()
-                output = self._engine.update(features, ts)
+                # ── Score / calibration logic ─────────────────────────────
+                if not self._was_calibrated:
+                    # --- Calibration phase: update every frame ---
+                    output = self._engine.update(features, ts)
+                    self._last_output = output
 
-                # ── Optional: draw MediaPipe skeleton (subtle) ─────────────
+                    if output.calibrated:
+                        # Calibration just completed → start demo timers
+                        self._was_calibrated = True
+                        self._demo_start   = now
+                        self._window_start = now
+                        print("[INFO] Calibration done. Demo timer started.")
+                else:
+                    # --- Evaluation phase: buffer → batch every 5 s ---
+                    self._feature_buf.append(features)
+                    window_elapsed = now - self._window_start  # type: ignore[operator]
+
+                    if window_elapsed >= _EVAL_WINDOW:
+                        output = self._engine.batch_evaluate(
+                            self._feature_buf, window_elapsed, ts
+                        )
+                        self._last_output  = output
+                        self._feature_buf.clear()
+                        self._window_start = now
+                    else:
+                        # Use the cached output between evaluations (no flicker)
+                        output = self._last_output  # type: ignore[assignment]
+
+                # ── Demo timer check ──────────────────────────────────────
+                if self._demo_start is not None:
+                    remaining = _DEMO_DURATION - (now - self._demo_start)
+                    if remaining <= 0:
+                        self._last_frame = frame.copy()
+                        break
+                else:
+                    remaining = _DEMO_DURATION   # timer not yet running
+
+                # ── Pink face bounding box ────────────────────────────────
+                if results.face_landmarks:
+                    h_f, w_f = frame.shape[:2]
+                    xs = [lm.x * w_f for lm in results.face_landmarks.landmark]
+                    ys = [lm.y * h_f for lm in results.face_landmarks.landmark]
+                    x1 = max(0, int(min(xs)) - 8)
+                    y1 = max(0, int(min(ys)) - 8)
+                    x2 = min(w_f, int(max(xs)) + 8)
+                    y2 = min(h_f, int(max(ys)) + 8)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), _PINK_HOT, 2)
+
+                # ── Pose skeleton (pink tones) ────────────────────────────
                 if results.pose_landmarks:
                     self._mp_drawing.draw_landmarks(
                         frame,
                         results.pose_landmarks,
                         self._mp_holistic.POSE_CONNECTIONS,
                         landmark_drawing_spec=self._mp_drawing.DrawingSpec(
-                            color=(60, 60, 80), thickness=1, circle_radius=2
+                            color=_PINK_MED, thickness=1, circle_radius=2
                         ),
                         connection_drawing_spec=self._mp_drawing.DrawingSpec(
-                            color=(60, 60, 80), thickness=1
+                            color=_PINK_LIGHT, thickness=1
                         ),
                     )
 
@@ -160,23 +215,138 @@ class HeartCVgnalApp:
                     frame = self._render_calibrating(frame, output)
                 else:
                     frame = self._render_score_panel(frame, features, output)
-                    frame = self._render_event_banner(frame, output, ts)
                     frame = self._render_status_dots(frame, features)
                     frame = self._render_active_signals(frame, output)
+                    frame = self._render_timer(frame, remaining, now)
+                    # Event banner rendered last so it sits on top of everything
+                    frame = self._render_event_banner(frame, output, ts)
 
-                # ── FPS counter ───────────────────────────────────────────
                 self._draw_fps(frame, ts)
 
                 cv2.imshow("Heart CV-gnal", frame)
 
                 key = cv2.waitKey(5) & 0xFF
-                if key in (ord('q'), 27):  # Q or ESC
-                    break
+                if key in (ord('q'), 27):
+                    self._cleanup()
+                    return
 
+        # ── 5-minute timer expired → show final static result screen ────
+        final_score = self._last_output.score if self._last_output else 50.0
+        self._show_final_screen(self._last_frame, final_score)
         self._cleanup()
 
     # ------------------------------------------------------------------
-    # Render: calibration screen
+    # Final Result Screen
+    # ------------------------------------------------------------------
+
+    def _show_final_screen(
+        self, last_frame: Optional[np.ndarray], score: float
+    ) -> None:
+        """
+        Render a static "Time's Up" result screen and block until any key.
+        """
+        if last_frame is None:
+            # Fallback: solid dark-pink canvas
+            result = np.full((720, 1280, 3), (50, 18, 65), dtype=np.uint8)
+        else:
+            # Heavily blur the last camera frame
+            result = cv2.GaussianBlur(last_frame, (61, 61), 25)
+
+        h, w = result.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        # Pink semi-transparent wash over the blurred frame
+        wash = np.full_like(result, (55, 18, 70))
+        cv2.addWeighted(wash, 0.60, result, 0.40, 0, result)
+
+        # Hot-pink accent bars (top & bottom)
+        cv2.rectangle(result, (0, 0),     (w, 10),  _PINK_HOT, -1)
+        cv2.rectangle(result, (0, h - 10),(w, h),   _PINK_HOT, -1)
+
+        # ── "Time's Up!" ──────────────────────────────────────────────
+        line1 = "Time's Up!"
+        (tw1, th1), _ = cv2.getTextSize(
+            line1, cv2.FONT_HERSHEY_DUPLEX, 2.2, 3
+        )
+        cv2.putText(
+            result, line1,
+            (cx - tw1 // 2, cy - 110),
+            cv2.FONT_HERSHEY_DUPLEX, 2.2, _PINK_LIGHT, 3, cv2.LINE_AA,
+        )
+
+        # ── "Final Affection Score: X / 100" ─────────────────────────
+        line2 = f"Final Affection Score:  {int(score)} / 100"
+        (tw2, th2), _ = cv2.getTextSize(
+            line2, cv2.FONT_HERSHEY_DUPLEX, 1.4, 2
+        )
+        cv2.putText(
+            result, line2,
+            (cx - tw2 // 2, cy - 10),
+            cv2.FONT_HERSHEY_DUPLEX, 1.4, _WHITE, 2, cv2.LINE_AA,
+        )
+        # Decorative underline
+        cv2.line(
+            result,
+            (cx - tw2 // 2, cy + 6),
+            (cx + tw2 // 2, cy + 6),
+            _PINK_HOT, 2,
+        )
+
+        # ── Conditional sub-text ──────────────────────────────────────
+        if score > 80:
+            sub       = "It's a Match!  <3"
+            sub_color = _PINK_LIGHT
+        elif score >= 50:
+            sub       = "Definitely Something There..."
+            sub_color = (210, 200, 255)
+        else:
+            sub       = "Let's Just Be Friends..."
+            sub_color = (160, 150, 200)
+
+        (tw3, _), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 2)
+        cv2.putText(
+            result, sub,
+            (cx - tw3 // 2, cy + 55),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.05, sub_color, 2, cv2.LINE_AA,
+        )
+
+        # ── Heart gauge bar ───────────────────────────────────────────
+        gw, gh = 520, 26
+        gx = cx - gw // 2
+        gy = cy + 100
+        fill = int(gw * score / 100.0)
+        # Track
+        cv2.rectangle(result, (gx, gy), (gx + gw, gy + gh), (30, 10, 40), -1)
+        # Fill (hot pink)
+        if fill > 0:
+            cv2.rectangle(result, (gx, gy), (gx + fill, gy + gh), _PINK_HOT, -1)
+        # White border
+        cv2.rectangle(result, (gx, gy), (gx + gw, gy + gh), _WHITE, 2)
+        # Score % label inside bar
+        pct = f"{int(score)}%"
+        (ptw, _), _ = cv2.getTextSize(pct, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.putText(
+            result, pct,
+            (gx + gw // 2 - ptw // 2, gy + gh - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, _WHITE, 1, cv2.LINE_AA,
+        )
+
+        # ── "Press any key to exit" hint ──────────────────────────────
+        hint = "Press any key to exit"
+        (twh, _), _ = cv2.getTextSize(
+            hint, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1
+        )
+        cv2.putText(
+            result, hint,
+            (cx - twh // 2, h - 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.52, _GRAY_DIM, 1, cv2.LINE_AA,
+        )
+
+        cv2.imshow("Heart CV-gnal", result)
+        cv2.waitKey(0)   # hold until presenter presses any key
+
+    # ------------------------------------------------------------------
+    # Render: calibration screen  (pink theme)
     # ------------------------------------------------------------------
 
     def _render_calibrating(
@@ -184,63 +354,57 @@ class HeartCVgnalApp:
     ) -> np.ndarray:
         h, w = frame.shape[:2]
 
-        # Darken the camera feed
+        # Dark pink vignette
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, h), (10, 10, 20), -1)
-        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+        cv2.rectangle(overlay, (0, 0), (w, h), (25, 8, 35), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
 
         cx, cy = w // 2, h // 2
 
-        # Title
         cv2.putText(
             frame, "HEART  CV-GNAL",
-            (cx - 190, cy - 90),
-            cv2.FONT_HERSHEY_DUPLEX, 1.4, (100, 200, 255), 2, cv2.LINE_AA,
+            (cx - 220, cy - 95),
+            cv2.FONT_HERSHEY_DUPLEX, 1.7, _PINK_LIGHT, 2, cv2.LINE_AA,
         )
-
-        # Sub-title
         cv2.putText(
             frame, "Affection / Interest Analyzer",
-            (cx - 175, cy - 55),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 180), 1, cv2.LINE_AA,
+            (cx - 180, cy - 52),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, _PINK_MED, 1, cv2.LINE_AA,
         )
-
-        # Instruction
         cv2.putText(
             frame, "Look straight at the camera to calibrate your baseline.",
-            (cx - 240, cy - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA,
+            (cx - 255, cy - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 175, 220), 1, cv2.LINE_AA,
         )
 
-        # Progress bar
-        bar_w, bar_h = 420, 22
+        # Pink progress bar with white border
+        bar_w, bar_h = 440, 24
         bx = cx - bar_w // 2
-        by = cy + 20
+        by = cy + 22
         fill = int(bar_w * output.calib_progress)
 
-        cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (40, 40, 50), -1)
+        cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (25, 8, 35), -1)
         if fill > 0:
-            cv2.rectangle(frame, (bx, by), (bx + fill, by + bar_h), (100, 200, 255), -1)
-        cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (80, 80, 110), 1)
+            cv2.rectangle(frame, (bx, by), (bx + fill, by + bar_h), _PINK_MED, -1)
+        cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), _WHITE, 1)
 
-        pct_text = f"{int(output.calib_progress * 100)}%"
+        pct = f"{int(output.calib_progress * 100)}%"
+        (ptw, _), _ = cv2.getTextSize(pct, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
         cv2.putText(
-            frame, pct_text,
-            (cx - 18, by + bar_h - 4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA,
+            frame, pct,
+            (cx - ptw // 2, by + bar_h - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50, _WHITE, 1, cv2.LINE_AA,
         )
 
-        # Hint
         cv2.putText(
             frame, "Q / ESC to quit",
-            (cx - 60, cy + 70),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 90, 110), 1, cv2.LINE_AA,
+            (cx - 62, cy + 74),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, _GRAY_DIM, 1, cv2.LINE_AA,
         )
-
         return frame
 
     # ------------------------------------------------------------------
-    # Render: right-side score panel
+    # Render: right-side score panel  (pink theme)
     # ------------------------------------------------------------------
 
     def _render_score_panel(
@@ -250,125 +414,125 @@ class HeartCVgnalApp:
         output: AffectionOutput,
     ) -> np.ndarray:
         h, w = frame.shape[:2]
-        pw  = _PANEL_W
-        px  = w - pw - _PANEL_PAD
-        py  = _PANEL_PAD
-        ph  = h - _PANEL_PAD * 2
+        pw = _PANEL_W
+        px = w - pw - _PANEL_PAD
+        py = _PANEL_PAD
+        ph = h - _PANEL_PAD * 2
 
-        # Semi-transparent panel background
+        # Dark aubergine panel background
         overlay = frame.copy()
-        cv2.rectangle(overlay, (px - 5, py), (px + pw, py + ph), (12, 12, 22), -1)
-        cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
-        cv2.rectangle(frame, (px - 5, py), (px + pw, py + ph), (55, 55, 80), 1)
+        cv2.rectangle(overlay, (px - 5, py), (px + pw, py + ph), _PINK_PANEL, -1)
+        cv2.addWeighted(overlay, 0.84, frame, 0.16, 0, frame)
+        cv2.rectangle(frame, (px - 5, py), (px + pw, py + ph), _PINK_BORDER, 1)
 
         score = output.score
-        color = _score_color(score)
 
-        # ── Header ────────────────────────────────────────────────────────
+        # ── Header ────────────────────────────────────────────────────
         cv2.putText(
-            frame, "AFFECTION  METER",
-            (px + 4, py + 20),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 150, 200), 1, cv2.LINE_AA,
+            frame, "HEART  GAUGE",
+            (px + 4, py + 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.52, _PINK_MED, 1, cv2.LINE_AA,
         )
+        # Thin separator under header
+        cv2.line(frame, (px, py + 30), (px + pw, py + 30), _PINK_BORDER, 1)
 
-        # ── Big score number ───────────────────────────────────────────────
+        # ── Big score number ───────────────────────────────────────────
         score_str = f"{int(score):3d}"
         cv2.putText(
             frame, score_str,
-            (px + 10, py + 85),
-            cv2.FONT_HERSHEY_DUPLEX, 2.8, color, 3, cv2.LINE_AA,
+            (px + 8, py + 95),
+            cv2.FONT_HERSHEY_DUPLEX, 2.9, _PINK_LIGHT, 3, cv2.LINE_AA,
         )
         cv2.putText(
             frame, "/ 100",
-            (px + 158, py + 85),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (110, 110, 130), 1, cv2.LINE_AA,
+            (px + 162, py + 95),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.58, _PINK_MED, 1, cv2.LINE_AA,
         )
 
-        # ── Mood label ────────────────────────────────────────────────────
+        # ── Mood label ────────────────────────────────────────────────
         cv2.putText(
             frame, _mood_label(score),
-            (px + 4, py + 107),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA,
+            (px + 4, py + 114),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, _PINK_LIGHT, 1, cv2.LINE_AA,
         )
 
-        # ── Gradient gauge bar ────────────────────────────────────────────
+        # ── Heart Gauge bar: filled hot-pink rectangle + white border ─
         gx   = px + 4
-        gy   = py + 118
+        gy   = py + 126
         gw   = pw - 8
-        gh   = 20
+        gh   = 24
         fill = int(gw * score / 100.0)
 
-        cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), (35, 35, 45), -1)
-        # Render gradient by drawing vertical slices
-        for i in range(fill):
-            t     = (i / max(1, gw - 1)) * 100.0
-            pixel = _score_color(t)
-            cv2.line(frame, (gx + i, gy + 1), (gx + i, gy + gh - 1), pixel, 1)
-        cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), (75, 75, 100), 1)
+        # Track (very dark)
+        cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), (22, 8, 30), -1)
+        # Fill (hot pink — solid, no gradient)
+        if fill > 0:
+            cv2.rectangle(frame, (gx, gy), (gx + fill, gy + gh), _PINK_HOT, -1)
+        # White border (aesthetic)
+        cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), _WHITE, 1)
 
-        # ── Divider ───────────────────────────────────────────────────────
-        dy0 = py + 148
-        cv2.line(frame, (px, dy0), (px + pw, dy0), (50, 50, 75), 1)
+        # ── Divider ───────────────────────────────────────────────────
+        dy0 = py + 162
+        cv2.line(frame, (px, dy0), (px + pw, dy0), _PINK_BORDER, 1)
 
-        # ── Metric readouts ───────────────────────────────────────────────
-        def _row(label: str, val_str: str, sub: str, y: int,
-                 val_color=(200, 200, 210)) -> None:
+        # ── Metric readouts ───────────────────────────────────────────
+        def _row(
+            label: str, val_str: str, sub: str, y: int,
+            val_color: tuple = _PINK_LIGHT,
+        ) -> None:
             cv2.putText(frame, label,   (px + 4,   y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (110, 110, 140), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, _PINK_MED,  1, cv2.LINE_AA)
             cv2.putText(frame, val_str, (px + 82,  y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, val_color,        1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, val_color,   1, cv2.LINE_AA)
             if sub:
                 cv2.putText(frame, sub, (px + 130, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (70, 70, 95), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, _GRAY_DIM, 1, cv2.LINE_AA)
 
         if features.face_detected:
             _row("Mouth ratio",
                  f"{features.mouth_ratio:.3f}",
                  f"(b {output.baseline_mouth:.3f})",
-                 py + 168)
+                 py + 180)
             _row("Eye ratio",
                  f"{features.eye_ratio:.3f}",
                  f"(b {output.baseline_eye:.3f})",
-                 py + 188)
+                 py + 198)
             _row("Roll angle",
-                 f"{features.roll_angle_deg:+.1f} deg",
-                 "",
-                 py + 208)
+                 f"{features.roll_angle_deg:+.1f}°", "",
+                 py + 216)
         else:
-            cv2.putText(frame, "No face detected", (px + 4, py + 188),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 80, 120), 1, cv2.LINE_AA)
+            cv2.putText(frame, "No face detected", (px + 4, py + 198),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GRAY_DIM, 1, cv2.LINE_AA)
 
         if features.pose_detected:
             _row("Shoulder",
                  f"{features.shoulder_ratio:.3f}",
                  f"(b {output.baseline_shoulder:.3f})",
-                 py + 230)
+                 py + 236)
             arm_val   = "CROSSED" if features.wrists_crossed else "free"
-            arm_color = (50, 50, 220) if features.wrists_crossed else (80, 160, 80)
-            _row("Arms",
-                 arm_val, "",
-                 py + 250, val_color=arm_color)
+            arm_color = _PINK_HOT if features.wrists_crossed else (90, 200, 120)
+            _row("Arms", arm_val, "", py + 254, val_color=arm_color)
         else:
-            cv2.putText(frame, "No pose detected", (px + 4, py + 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 80, 120), 1, cv2.LINE_AA)
+            cv2.putText(frame, "No pose detected", (px + 4, py + 244),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GRAY_DIM, 1, cv2.LINE_AA)
 
-        # ── Divider ───────────────────────────────────────────────────────
-        dy1 = py + 268
-        cv2.line(frame, (px, dy1), (px + pw, dy1), (50, 50, 75), 1)
+        # ── Divider ───────────────────────────────────────────────────
+        dy1 = py + 272
+        cv2.line(frame, (px, dy1), (px + pw, dy1), _PINK_BORDER, 1)
 
-        # ── Event log (last 4 events) ─────────────────────────────────────
+        # ── Event log (last 4 events) ─────────────────────────────────
         cv2.putText(frame, "Recent events", (px + 4, dy1 + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (90, 90, 120), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, _PINK_MED, 1, cv2.LINE_AA)
         for i, evt in enumerate(output.event_log[:4]):
-            alpha = 1.0 - i * 0.22
-            col   = tuple(int(c * alpha) for c in (180, 180, 220))  # type: ignore[misc]
+            alpha = max(0.35, 1.0 - i * 0.22)
+            col   = tuple(int(c * alpha) for c in _PINK_LIGHT)  # type: ignore[misc]
             cv2.putText(frame, evt, (px + 4, dy1 + 34 + i * 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.32, col, 1, cv2.LINE_AA)
 
         return frame
 
     # ------------------------------------------------------------------
-    # Render: event banner (top-centre, fades after _EVENT_DISPLAY_SECS)
+    # Render: event popup banner  (top-centre, fades over _EVENT_DISPLAY)
     # ------------------------------------------------------------------
 
     def _render_event_banner(
@@ -378,90 +542,147 @@ class HeartCVgnalApp:
         ts: float,
     ) -> np.ndarray:
         age = ts - output.last_event_time
-        if age > _EVENT_DISPLAY_SECS or not output.last_event_text:
+        if age > _EVENT_DISPLAY or not output.last_event_text:
             return frame
 
-        # Classify event for colour
         text = output.last_event_text
-        if "+" in text:
-            bg  = (30,  80, 200)   # BGR: reddish-orange → positive
-            fg  = (255, 255, 255)
-        elif "-" in text or "Barrier" in text:
-            bg  = (60,  30, 160)   # BGR: deep blue → negative
-            fg  = (200, 200, 255)
+        if text.startswith("+"):
+            bg = _PINK_HOT          # hot pink → positive points
+            fg = _WHITE
+        elif text.startswith("-"):
+            bg = (80, 20, 100)      # dark purple → penalty
+            fg = _PINK_LIGHT
         else:
-            bg  = (60,  60,  60)
-            fg  = (230, 230, 230)
+            bg = (55, 35, 70)
+            fg = (220, 200, 240)
 
         h, w = frame.shape[:2]
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.75, 2)
-        bx = (w - tw) // 2 - 16
-        by = 18
-        bw = tw + 32
-        bh = th + 18
+        font_scale = 0.95
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, font_scale, 2)
+        bx = (w - tw) // 2 - 22
+        by = 16
+        bw = tw + 44
+        bh = th + 24
 
-        # Pill background
+        # Pill background with fade-out alpha
         overlay = frame.copy()
         cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), bg, -1)
-        alpha_val = max(0.0, 1.0 - age / _EVENT_DISPLAY_SECS)
-        cv2.addWeighted(overlay, alpha_val * 0.88, frame, 1 - alpha_val * 0.88, 0, frame)
+        alpha_val = max(0.0, 1.0 - (age / _EVENT_DISPLAY) ** 1.5)
+        cv2.addWeighted(overlay, alpha_val * 0.92, frame, 1 - alpha_val * 0.92, 0, frame)
 
-        # Border
-        cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), fg, 1)
+        # White border
+        cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), _WHITE, 1)
 
         # Text
         cv2.putText(
             frame, text,
-            ((w - tw) // 2, by + th + 8),
-            cv2.FONT_HERSHEY_DUPLEX, 0.75, fg, 2, cv2.LINE_AA,
+            ((w - tw) // 2, by + th + 12),
+            cv2.FONT_HERSHEY_DUPLEX, font_scale, fg, 2, cv2.LINE_AA,
         )
         return frame
 
     # ------------------------------------------------------------------
-    # Render: detection status dots (top-left)
+    # Render: demo countdown timer  (top-left)
+    # ------------------------------------------------------------------
+
+    def _render_timer(
+        self, frame: np.ndarray, remaining: float, now: float
+    ) -> np.ndarray:
+        mins = max(0, int(remaining)) // 60
+        secs = max(0, int(remaining)) % 60
+        timer_text = f"DEMO  {mins}:{secs:02d}"
+
+        # Urgent colour when < 60 s remain
+        color = _PINK_HOT if remaining < 60 else _PINK_MED
+
+        # Pill background for legibility
+        (tw, th), _ = cv2.getTextSize(
+            timer_text, cv2.FONT_HERSHEY_DUPLEX, 0.68, 1
+        )
+        tx, ty = _PANEL_PAD, 58
+        pad = 5
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (tx - pad, ty - th - pad),
+            (tx + tw + pad, ty + pad),
+            _PINK_PANEL, -1,
+        )
+        cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
+        cv2.rectangle(
+            frame,
+            (tx - pad, ty - th - pad),
+            (tx + tw + pad, ty + pad),
+            color, 1,
+        )
+        cv2.putText(
+            frame, timer_text,
+            (tx, ty),
+            cv2.FONT_HERSHEY_DUPLEX, 0.68, color, 1, cv2.LINE_AA,
+        )
+
+        # Thin window-progress bar just below the timer pill
+        # (shows how long until the next 5-second evaluation fires)
+        if self._window_start is not None:
+            elapsed = now - self._window_start
+            ratio = min(1.0, elapsed / _EVAL_WINDOW)
+            bar_x = tx - pad
+            bar_y = ty + pad + 3
+            bar_w = tw + pad * 2
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 4),
+                          (25, 8, 35), -1)
+            if ratio > 0:
+                cv2.rectangle(
+                    frame,
+                    (bar_x, bar_y),
+                    (bar_x + int(bar_w * ratio), bar_y + 4),
+                    _PINK_MED, -1,
+                )
+
+        return frame
+
+    # ------------------------------------------------------------------
+    # Render: detection status dots  (top-left)
     # ------------------------------------------------------------------
 
     def _render_status_dots(
         self, frame: np.ndarray, features: FrameFeatures
     ) -> np.ndarray:
-        items = [
-            ("Face", features.face_detected),
-            ("Pose", features.pose_detected),
-        ]
+        items = [("Face", features.face_detected), ("Pose", features.pose_detected)]
         for i, (label, ok) in enumerate(items):
-            color = (50, 200, 80) if ok else (50, 50, 160)
+            color = (80, 200, 120) if ok else _PINK_HOT
             x = _PANEL_PAD + i * 90
             y = _PANEL_PAD + 14
             cv2.circle(frame, (x, y), 6, color, -1)
             cv2.putText(frame, label, (x + 10, y + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 180), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, _PINK_MED, 1, cv2.LINE_AA)
         return frame
 
     # ------------------------------------------------------------------
-    # Render: active-signal badges (below status dots)
+    # Render: active-signal badges  (left column)
     # ------------------------------------------------------------------
 
     def _render_active_signals(
         self, frame: np.ndarray, output: AffectionOutput
     ) -> np.ndarray:
-        signals: list[tuple[str, tuple[int, int, int]]] = []
+        signals: list[tuple[str, tuple]] = []
         if output.is_leaning:
-            signals.append(("LEAN IN",  (50, 200, 100)))
+            signals.append(("LEAN IN", (90, 210, 130)))
         if output.is_syncing:
-            signals.append(("SYNC",     (50, 220, 220)))
+            signals.append(("SYNC",    _PINK_LIGHT))
         if output.is_barrier:
-            signals.append(("BARRIER",  (50,  50, 220)))
+            signals.append(("BARRIER", _PINK_HOT))
 
         for i, (sig, col) in enumerate(signals):
             cv2.putText(
                 frame, f">> {sig}",
                 (_PANEL_PAD, _PANEL_PAD + 40 + i * 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.43, col, 1, cv2.LINE_AA,
             )
         return frame
 
     # ------------------------------------------------------------------
-    # Render: FPS counter (bottom-left)
+    # FPS counter  (bottom-left, subtle)
     # ------------------------------------------------------------------
 
     _prev_ts: float = 0.0
@@ -474,7 +695,7 @@ class HeartCVgnalApp:
             cv2.putText(
                 frame, f"{fps:.0f} fps",
                 (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (70, 70, 90), 1, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GRAY_DIM, 1, cv2.LINE_AA,
             )
         self._prev_ts = ts
 
