@@ -175,19 +175,17 @@ class FeatureExtractor:
         out.shoulder_ratio = _dist2d(lm[_SHOULDER_L], lm[_SHOULDER_R])
 
         # ── Wrists Crossed ───────────────────────────────────────────────
-        # Spec: left wrist past right shoulder AND right wrist past left
-        # shoulder simultaneously → defensive barrier posture.
+        # 왼손목 x > 오른손목 x 이면 손목이 엇갈린 것 → 팔짱 낀 상태.
+        # 가시성 미달 시 반대편으로 spurious trigger 방지.
         ls_x = lm[_SHOULDER_L].x
         rs_x = lm[_SHOULDER_R].x
 
-        # Use wrist only if sufficiently visible; otherwise default to its
-        # resting side so the condition cannot spuriously trigger.
         lw_x = (lm[_WRIST_L].x if lm[_WRIST_L].visibility > _VIS_THRESH
                 else ls_x)
         rw_x = (lm[_WRIST_R].x if lm[_WRIST_R].visibility > _VIS_THRESH
                 else rs_x)
 
-        out.wrists_crossed = (lw_x > rs_x) and (rw_x < ls_x)
+        out.wrists_crossed = lw_x < rw_x
 
         return True
 

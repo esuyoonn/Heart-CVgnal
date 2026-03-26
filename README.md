@@ -26,6 +26,8 @@
 ```bash
 conda activate dslcv2
 PYTHONPATH=src python apps/run_heart_cvgnal.py
+# Windows Powershell
+$env:PYTHONPATH="src"; python apps/run_heart_cvgnal.py
 ```
 
 ### macOS 더블클릭
