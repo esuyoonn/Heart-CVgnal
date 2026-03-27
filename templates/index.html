@@ -639,6 +639,87 @@
       color: var(--text-soft);
       margin-top: 6px;
     }
+
+    /* ═══════════════════════════════════════════════════
+       VLM Panel
+    ═══════════════════════════════════════════════════ */
+    #vlm-body { font-size: 0.68rem; }
+
+    .vlm-offline {
+      color: var(--text-soft);
+      font-style: italic;
+    }
+
+    .vlm-waiting {
+      color: var(--pink-pastel);
+      font-style: italic;
+    }
+
+    .vlm-score-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    .vlm-num {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.6rem;
+      line-height: 1;
+      color: var(--pink-deep);
+    }
+
+    .vlm-denom { color: var(--text-mid); font-size: 0.75rem; }
+
+    .vlm-age { color: var(--text-soft); font-size: 0.60rem; margin-left: auto; }
+
+    .vlm-mini-track {
+      height: 6px;
+      background: rgba(244,184,208,0.25);
+      border-radius: 99px;
+      overflow: hidden;
+      margin-bottom: 6px;
+    }
+
+    .vlm-mini-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--pink-light), var(--pink-pastel));
+      border-radius: 99px;
+      transition: width 1.2s cubic-bezier(.25,.46,.45,.94);
+    }
+
+    .vlm-meta {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+
+    .vlm-conf {
+      font-size: 0.58rem;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 99px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .vlm-conf.high   { background: rgba(92,219,106,0.15); color: #3db34a; border: 1px solid rgba(92,219,106,0.4); }
+    .vlm-conf.medium { background: rgba(232,121,156,0.10); color: var(--pink-pastel); border: 1px solid rgba(232,121,156,0.3); }
+    .vlm-conf.low    { background: rgba(176,154,184,0.15); color: var(--text-soft); border: 1px solid rgba(176,154,184,0.3); }
+
+    .vlm-agree {
+      font-size: 0.58rem;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }
+    .vlm-agree.yes { color: #3db34a; }
+    .vlm-agree.no  { color: var(--pink-deep); }
+
+    .vlm-reasoning {
+      color: var(--text-mid);
+      font-style: italic;
+      line-height: 1.4;
+    }
   </style>
 </head>
 
@@ -766,9 +847,15 @@
       </div>
 
       <!-- Event log -->
-      <div class="card" style="flex: 1; overflow: hidden;">
+      <div class="card" style="overflow: hidden;">
         <div class="card-title">Recent Events</div>
         <div id="event-log"></div>
+      </div>
+
+      <!-- VLM Cross-Validator -->
+      <div class="card" id="vlm-card" style="flex-shrink: 0;">
+        <div class="card-title">VLM Opinion</div>
+        <div id="vlm-body"></div>
       </div>
 
     </div>
@@ -857,6 +944,7 @@
     function renderSignals(d) {
       let html = '';
       if (d.is_leaning)      html += '<span class="badge badge-green">▲ Lean In</span>';
+      if (d.is_tilting)      html += '<span class="badge badge-green">↗ Head Tilt</span>';
       if (d.is_looking_away) html += '<span class="badge badge-red">👀 Look Away</span>';
       if (d.is_barrier)      html += '<span class="badge badge-red">✖ Barrier</span>';
       document.getElementById('signals').innerHTML = html;
@@ -957,8 +1045,48 @@
         showToast(d.event_message);
       }
 
+      /* === VLM panel === */
+      renderVLM(d);
+
       /* === Final screen === */
       if (d.is_finished) showFinalScreen(d.score, d.final_message);
+    }
+
+    /* ── VLM panel renderer ──────────────────────────────────────────*/
+    function renderVLM(d) {
+      const el = document.getElementById('vlm-body');
+
+      if (!d.vlm_available) {
+        el.innerHTML = '<div class="vlm-offline">Claude VLM offline<br><span style="font-size:0.60rem">pip install anthropic</span></div>';
+        return;
+      }
+
+      if (d.vlm_score === null) {
+        el.innerHTML = '<div class="vlm-waiting">Analyzing first frame…</div>';
+        return;
+      }
+
+      const agreeClass = d.vlm_agree ? 'yes' : 'no';
+      const agreeText  = d.vlm_agree ? '✓ Systems Agree' : '⚠ Conflicting';
+      const confClass  = d.vlm_confidence || 'low';
+      const fillPct    = d.vlm_score + '%';
+      const ageText    = d.vlm_age_s !== null ? `${d.vlm_age_s}s ago` : '';
+
+      el.innerHTML = `
+        <div class="vlm-score-row">
+          <span class="vlm-num">${d.vlm_score}</span>
+          <span class="vlm-denom">/ 100</span>
+          <span class="vlm-age">${ageText}</span>
+        </div>
+        <div class="vlm-mini-track">
+          <div class="vlm-mini-fill" style="width:${fillPct}"></div>
+        </div>
+        <div class="vlm-meta">
+          <span class="vlm-conf ${confClass}">${confClass}</span>
+          <span class="vlm-agree ${agreeClass}">${agreeText}</span>
+        </div>
+        <div class="vlm-reasoning">"${d.vlm_reasoning}"</div>
+      `;
     }
 
     /* ── Poll loop ───────────────────────────────────────────*/

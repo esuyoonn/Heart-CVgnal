@@ -7,6 +7,10 @@ numpy>=1.26,<2.0
 opencv-python>=4.10,<4.11
 mediapipe>=0.10.14,<0.11
 pillow>=10.4,<11
+flask>=3.0,<4.0
+
+# Optional — VLM cross-validator (set ANTHROPIC_API_KEY to activate)
+# anthropic>=0.40,<1.0
 
 # Test
 pytest>=8.3,<8.4

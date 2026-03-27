@@ -7,9 +7,9 @@ Rule-based evaluation of four psychologically-grounded signals.
   --------------------|-----------|--------------------------------------------
   Duchenne Smile      | +5 pts    | mouth_ratio spikes AND eye_ratio drops
   Leaning In          | +4 pts    | shoulder_ratio > 1.15 × baseline (≥50% of window)
-  Synchrony           | +3 pts    | sustained head tilt (5-25°, ≥30% of window)
-  Nodding             | +2 pts    | high nose-y variance across window
-  Barrier Signal      | -5 pts    | both wrists crossed ≥50% of window
+  Head Pose Penalty   | −3 pts    | avg Yaw > ±20° over 5-second window
+  Head Pose Penalty   | −3 pts    | avg Pitch > ±15° over 5-second window
+  Barrier Signal      | −5 pts    | both wrists crossed ≥50% of window
 
 Scoring runs in TWO phases:
   1. Per-frame  — used ONLY during the 3-second calibration phase (``update()``)
@@ -60,9 +60,10 @@ class AffectionOutput:
     baseline_shoulder: float
 
     # ── Active-signal flags (updated every batch window) ─────────────
-    is_leaning:  bool
-    is_barrier:  bool
-    is_syncing:  bool
+    is_leaning:      bool
+    is_barrier:      bool
+    is_looking_away: bool   # True when head pose penalty fired this window
+    is_tilting:      bool   # True when moderate head tilt detected this window
 
     # ── Event notification (drives the popup banner) ──────────────────
     last_event_text: str
@@ -99,17 +100,24 @@ class AffectionEngine:
     LEAN_PTS:         float = 4.0    # awarded when ≥50 % of pose-frames lean
     LEAN_THRESHOLD:   float = 0.50
 
-    # ── Rule 3: Synchrony ────────────────────────────────────────────────
-    SYNC_TILT_MIN_DEG:  float = 5.0
-    SYNC_TILT_MAX_DEG:  float = 25.0
-    SYNC_PTS:           float = 3.0   # awarded when ≥30 % of face-frames tilt
-    SYNC_THRESHOLD:     float = 0.30
-    NOD_PTS:            float = 2.0   # awarded for detected nodding
-    NODDING_STD:        float = 0.007
+    # ── Rule 3: Head Pose Penalty ────────────────────────────────────────
+    # A penalty fires when the AVERAGE angle over the 5-second window exceeds
+    # the threshold — averaging suppresses single-frame noise spikes.
+    POSE_YAW_DEG:     float = 20.0   # abs(avg_yaw)   > this → −3 pts
+    POSE_PITCH_DEG:   float = 15.0   # abs(avg_pitch) > this → −3 pts
+    POSE_PENALTY_PTS: float = 3.0
 
     # ── Rule 4: Barrier Signal ───────────────────────────────────────────
     BARRIER_THRESHOLD:  float = 0.50   # min fraction of pose-frames crossed
     BARRIER_PTS:        float = 5.0    # deducted when threshold met
+
+    # ── Rule 5: Head Tilt (Roll) ─────────────────────────────────────────
+    # A moderate head tilt during conversation is a validated interest signal.
+    # Too small = neutral upright; too large = just posture/habit.
+    ROLL_MIN_DEG:   float = 5.0    # abs(avg_roll) must exceed this
+    ROLL_MAX_DEG:   float = 20.0   # abs(avg_roll) must stay below this
+    ROLL_THRESHOLD: float = 0.40   # min fraction of face-frames tilting
+    ROLL_PTS:       float = 2.0    # awarded when threshold met
 
     # ── Score bounds ─────────────────────────────────────────────────────
     SCORE_MIN: float = 0.0
@@ -132,10 +140,11 @@ class AffectionEngine:
         self._score: float = 50.0
 
         # ── Per-batch signal state (updated by batch_evaluate) ───────────
-        self._duchenne_last: float = 0.0
-        self._was_leaning:   bool  = False
-        self._is_syncing:    bool  = False
-        self._is_barrier:    bool  = False
+        self._duchenne_last:    float = 0.0
+        self._was_leaning:      bool  = False
+        self._is_looking_away:  bool  = False
+        self._is_barrier:       bool  = False
+        self._is_tilting:       bool  = False
 
         # ── Events ───────────────────────────────────────────────────────
         self._last_event_text: str   = ""
@@ -221,30 +230,27 @@ class AffectionEngine:
         else:
             self._was_leaning = False
 
-        # ── Rule 3: Synchrony (head tilt OR nodding) ──────────────────
+        # ── Rule 3: Head Pose Penalty ─────────────────────────────────
+        # Average the solvePnP angles over the window — single-frame spikes
+        # (blinks, micro-movements) are absorbed; only sustained look-aways fire.
         if n_face > 0:
-            tilt_n = sum(
-                1 for f in face_frames
-                if self.SYNC_TILT_MIN_DEG <= abs(f.roll_angle_deg) <= self.SYNC_TILT_MAX_DEG
-            )
-            tilt_ratio = tilt_n / n_face
-            nose_ys    = [f.nose_y for f in face_frames]
-            nodding    = (
-                len(nose_ys) > 5
-                and float(np.std(nose_ys)) > self.NODDING_STD
-            )
-            self._is_syncing = tilt_ratio >= self.SYNC_THRESHOLD or nodding
+            avg_yaw   = float(np.mean([f.yaw_deg   for f in face_frames]))
+            avg_pitch = float(np.mean([f.pitch_deg for f in face_frames]))
 
-            if tilt_ratio >= self.SYNC_THRESHOLD:
-                d = self.SYNC_PTS
-                self._score += d
-                pos_events.append((d, f"+{int(d)} pts! Great Eye Contact!"))
-            elif nodding:
-                d = self.NOD_PTS
-                self._score += d
-                pos_events.append((d, f"+{int(d)} pts! Nodding Along!"))
+            yaw_penalty   = abs(avg_yaw)   > self.POSE_YAW_DEG
+            pitch_penalty = abs(avg_pitch) > self.POSE_PITCH_DEG
+            self._is_looking_away = yaw_penalty or pitch_penalty
+
+            if yaw_penalty:
+                d = self.POSE_PENALTY_PTS
+                self._score -= d
+                neg_events.append((d, f"Look at me!  -{int(d)}"))
+            if pitch_penalty:
+                d = self.POSE_PENALTY_PTS
+                self._score -= d
+                neg_events.append((d, f"Look at me!  -{int(d)}"))
         else:
-            self._is_syncing = False
+            self._is_looking_away = False
 
         # ── Rule 4: Barrier Signal ────────────────────────────────────
         if n_pose > 0:
@@ -257,6 +263,21 @@ class AffectionEngine:
                 neg_events.append((d, f"-{int(d)} pts! Barrier Signal!"))
         else:
             self._is_barrier = False
+
+        # ── Rule 5: Head Tilt (Roll) ──────────────────────────────────
+        # Moderate tilt (ROLL_MIN_DEG ~ ROLL_MAX_DEG) = interest signal.
+        if n_face > 0:
+            tilt_n = sum(
+                1 for f in face_frames
+                if self.ROLL_MIN_DEG <= abs(f.roll_angle_deg) <= self.ROLL_MAX_DEG
+            )
+            self._is_tilting = (tilt_n / n_face) >= self.ROLL_THRESHOLD
+            if self._is_tilting:
+                d = self.ROLL_PTS
+                self._score += d
+                pos_events.append((d, f"+{int(d)} pts! Head Tilt!"))
+        else:
+            self._is_tilting = False
 
         # ── Clamp score ───────────────────────────────────────────────
         self._score = max(self.SCORE_MIN, min(self.SCORE_MAX, self._score))
@@ -315,7 +336,8 @@ class AffectionEngine:
             baseline_shoulder  = self._baseline_shoulder,
             is_leaning         = self._was_leaning,
             is_barrier         = self._is_barrier,
-            is_syncing         = self._is_syncing,
+            is_looking_away    = self._is_looking_away,
+            is_tilting         = self._is_tilting,
             last_event_text    = self._last_event_text,
             last_event_time    = self._last_event_time,
             event_log          = list(self._event_log),

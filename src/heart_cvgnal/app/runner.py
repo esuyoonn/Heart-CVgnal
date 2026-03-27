@@ -18,12 +18,15 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
+import threading
+
 import cv2
 import mediapipe as mp
 import numpy as np
 
 from ..pipelines.vision.affection_engine import AffectionEngine, AffectionOutput
 from ..pipelines.vision.feature_extractor import FeatureExtractor, FrameFeatures
+from ..pipelines.vision.vlm_analyzer import VLMAnalyzer
 
 # ---------------------------------------------------------------------------
 # Demo configuration
@@ -113,6 +116,10 @@ class HeartCVgnalApp:
         self._was_calibrated: bool                      = False
         self._last_frame:     Optional[np.ndarray]      = None
 
+        # ── VLM cross-validator (optional — degrades silently if unavailable) ─
+        self._vlm             = VLMAnalyzer()
+        self._blended_score: float = 50.0
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -146,7 +153,8 @@ class HeartCVgnalApp:
                 rgb.flags.writeable = True
 
                 # ── Feature extraction ────────────────────────────────────
-                features = self._extractor.extract(results)
+                h_fr, w_fr = frame.shape[:2]
+                features = self._extractor.extract(results, w_fr, h_fr)
 
                 # ── Score / calibration logic ─────────────────────────────
                 if not self._was_calibrated:
@@ -175,6 +183,13 @@ class HeartCVgnalApp:
                     else:
                         # Use the cached output between evaluations (no flicker)
                         output = self._last_output  # type: ignore[assignment]
+
+                # ── VLM: async trigger + blend score for display ─────────
+                if self._was_calibrated:
+                    self._vlm.maybe_trigger(frame, now)
+                    self._blended_score = self._vlm.blend(output.score)
+                else:
+                    self._blended_score = output.score
 
                 # ── Demo timer check ──────────────────────────────────────
                 if self._demo_start is not None:
@@ -425,7 +440,7 @@ class HeartCVgnalApp:
         cv2.addWeighted(overlay, 0.84, frame, 0.16, 0, frame)
         cv2.rectangle(frame, (px - 5, py), (px + pw, py + ph), _PINK_BORDER, 1)
 
-        score = output.score
+        score = self._blended_score   # blend of rule-based + VLM (falls back to rule-only)
 
         # ── Header ────────────────────────────────────────────────────
         cv2.putText(
@@ -497,9 +512,15 @@ class HeartCVgnalApp:
                  f"{features.eye_ratio:.3f}",
                  f"(b {output.baseline_eye:.3f})",
                  py + 198)
-            _row("Roll angle",
-                 f"{features.roll_angle_deg:+.1f}°", "",
-                 py + 216)
+            # Head pose angles (from solvePnP) — penalty triggers above ±20°/±15°
+            yaw_color   = _PINK_HOT if abs(features.yaw_deg)   > 20 else _PINK_LIGHT
+            pitch_color = _PINK_HOT if abs(features.pitch_deg) > 15 else _PINK_LIGHT
+            _row("Head Yaw",
+                 f"{features.yaw_deg:+.1f}°", "",
+                 py + 216, val_color=yaw_color)
+            _row("Head Pitch",
+                 f"{features.pitch_deg:+.1f}°", "",
+                 py + 234, val_color=pitch_color)
         else:
             cv2.putText(frame, "No face detected", (px + 4, py + 198),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GRAY_DIM, 1, cv2.LINE_AA)
@@ -508,16 +529,16 @@ class HeartCVgnalApp:
             _row("Shoulder",
                  f"{features.shoulder_ratio:.3f}",
                  f"(b {output.baseline_shoulder:.3f})",
-                 py + 236)
+                 py + 254)
             arm_val   = "CROSSED" if features.wrists_crossed else "free"
             arm_color = _PINK_HOT if features.wrists_crossed else (90, 200, 120)
-            _row("Arms", arm_val, "", py + 254, val_color=arm_color)
+            _row("Arms", arm_val, "", py + 272, val_color=arm_color)
         else:
-            cv2.putText(frame, "No pose detected", (px + 4, py + 244),
+            cv2.putText(frame, "No pose detected", (px + 4, py + 262),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GRAY_DIM, 1, cv2.LINE_AA)
 
         # ── Divider ───────────────────────────────────────────────────
-        dy1 = py + 272
+        dy1 = py + 290
         cv2.line(frame, (px, dy1), (px + pw, dy1), _PINK_BORDER, 1)
 
         # ── Event log (last 4 events) ─────────────────────────────────
@@ -528,6 +549,61 @@ class HeartCVgnalApp:
             col   = tuple(int(c * alpha) for c in _PINK_LIGHT)  # type: ignore[misc]
             cv2.putText(frame, evt, (px + 4, dy1 + 34 + i * 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.32, col, 1, cv2.LINE_AA)
+
+        # ── VLM cross-validator panel ──────────────────────────────────
+        dy2 = dy1 + 106   # fixed offset — enough room for 4 event-log rows
+        cv2.line(frame, (px, dy2), (px + pw, dy2), _PINK_BORDER, 1)
+
+        ts_now = time.monotonic()
+        vlm    = self._vlm.get_result()
+
+        if not self._vlm.available:
+            # Module disabled or anthropic not installed — one-liner hint
+            cv2.putText(frame, "VLM  offline", (px + 4, dy2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, _GRAY_DIM, 1, cv2.LINE_AA)
+
+        elif vlm is None:
+            # Available but waiting for first response
+            cv2.putText(frame, "VLM  analyzing...", (px + 4, dy2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, _PINK_MED, 1, cv2.LINE_AA)
+
+        else:
+            age_s = int(ts_now - vlm.timestamp)
+
+            # Row 1: section title + age
+            cv2.putText(frame, "VLM OPINION", (px + 4, dy2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, _PINK_MED, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"{age_s}s ago", (px + 170, dy2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, _GRAY_DIM, 1, cv2.LINE_AA)
+
+            # Row 2: mini score bar
+            vgx, vgy = px + 4, dy2 + 20
+            vgw, vgh = pw - 8, 10
+            vfill    = int(vgw * vlm.score / 100.0)
+            cv2.rectangle(frame, (vgx, vgy), (vgx + vgw, vgy + vgh), (22, 8, 30), -1)
+            if vfill > 0:
+                cv2.rectangle(frame, (vgx, vgy), (vgx + vfill, vgy + vgh), _PINK_MED, -1)
+            cv2.rectangle(frame, (vgx, vgy), (vgx + vgw, vgy + vgh), _WHITE, 1)
+
+            # Row 3: numeric score + confidence
+            conf_col = (90, 200, 120) if vlm.confidence == "high" \
+                       else _PINK_MED if vlm.confidence == "medium" \
+                       else _GRAY_DIM
+            cv2.putText(frame, f"{int(vlm.score):3d}", (px + 4, dy2 + 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, _PINK_LIGHT, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"{vlm.confidence} conf.", (px + 48, dy2 + 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, conf_col, 1, cv2.LINE_AA)
+
+            # Row 4: agreement indicator (compare raw rule score vs VLM)
+            delta      = abs(output.score - vlm.score)
+            agree_text = "Systems Agree  v" if delta < 15 else "Conflicting  !"
+            agree_col  = (90, 200, 120) if delta < 15 else _PINK_HOT
+            cv2.putText(frame, agree_text, (px + 4, dy2 + 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, agree_col, 1, cv2.LINE_AA)
+
+            # Row 5: reasoning text (truncated to fit panel width)
+            cv2.putText(frame, f'"{vlm.reasoning[:30]}"', (px + 4, dy2 + 76),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.29, (180, 165, 200), 1, cv2.LINE_AA)
 
         return frame
 
@@ -667,11 +743,11 @@ class HeartCVgnalApp:
     ) -> np.ndarray:
         signals: list[tuple[str, tuple]] = []
         if output.is_leaning:
-            signals.append(("LEAN IN", (90, 210, 130)))
-        if output.is_syncing:
-            signals.append(("SYNC",    _PINK_LIGHT))
+            signals.append(("LEAN IN",    (90, 210, 130)))
+        if output.is_looking_away:
+            signals.append(("LOOK AWAY",  _PINK_HOT))
         if output.is_barrier:
-            signals.append(("BARRIER", _PINK_HOT))
+            signals.append(("BARRIER",    _PINK_HOT))
 
         for i, (sig, col) in enumerate(signals):
             cv2.putText(
