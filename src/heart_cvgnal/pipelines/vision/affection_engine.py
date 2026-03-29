@@ -7,8 +7,8 @@ Rule-based evaluation of four psychologically-grounded signals.
   --------------------|-----------|--------------------------------------------
   Duchenne Smile      | +5 pts    | mouth_ratio spikes AND eye_ratio drops
   Leaning In          | +4 pts    | shoulder_ratio > 1.15 × baseline (≥50% of window)
-  Head Pose Penalty   | −3 pts    | avg Yaw > ±20° over 5-second window
-  Head Pose Penalty   | −3 pts    | avg Pitch > ±15° over 5-second window
+  Head Pose Penalty   | −3 pts    | Yaw > ±40° in ≥50% of face-frames in window
+  Head Pose Penalty   | −3 pts    | Pitch > ±30° in ≥50% of face-frames in window
   Barrier Signal      | −5 pts    | both wrists crossed ≥50% of window
 
 Scoring runs in TWO phases:
@@ -101,11 +101,13 @@ class AffectionEngine:
     LEAN_THRESHOLD:   float = 0.50
 
     # ── Rule 3: Head Pose Penalty ────────────────────────────────────────
-    # A penalty fires when the AVERAGE angle over the 5-second window exceeds
-    # the threshold — averaging suppresses single-frame noise spikes.
-    POSE_YAW_DEG:     float = 20.0   # abs(avg_yaw)   > this → −3 pts
-    POSE_PITCH_DEG:   float = 15.0   # abs(avg_pitch) > this → −3 pts
-    POSE_PENALTY_PTS: float = 3.0
+    # A penalty fires when enough frames show a clearly-turned head.
+    # Frame-fraction method (same pattern as Leaning In / Barrier) is more
+    # stable than averaging — a brief glance away won't fire the rule.
+    POSE_YAW_DEG:       float = 40.0   # per-frame threshold: clearly turned sideways
+    POSE_PITCH_DEG:     float = 30.0   # per-frame threshold: clearly looking up/down
+    POSE_THRESHOLD:     float = 0.50   # min fraction of face-frames exceeding threshold
+    POSE_PENALTY_PTS:   float = 3.0
 
     # ── Rule 4: Barrier Signal ───────────────────────────────────────────
     BARRIER_THRESHOLD:  float = 0.50   # min fraction of pose-frames crossed
@@ -231,14 +233,15 @@ class AffectionEngine:
             self._was_leaning = False
 
         # ── Rule 3: Head Pose Penalty ─────────────────────────────────
-        # Average the solvePnP angles over the window — single-frame spikes
-        # (blinks, micro-movements) are absorbed; only sustained look-aways fire.
+        # Fire only when ≥50% of face-frames show a clearly-turned head.
+        # This matches the frame-fraction pattern used by Leaning In / Barrier,
+        # and avoids penalising brief natural glances.
         if n_face > 0:
-            avg_yaw   = float(np.mean([f.yaw_deg   for f in face_frames]))
-            avg_pitch = float(np.mean([f.pitch_deg for f in face_frames]))
+            yaw_n   = sum(1 for f in face_frames if abs(f.yaw_deg)   > self.POSE_YAW_DEG)
+            pitch_n = sum(1 for f in face_frames if abs(f.pitch_deg) > self.POSE_PITCH_DEG)
 
-            yaw_penalty   = abs(avg_yaw)   > self.POSE_YAW_DEG
-            pitch_penalty = abs(avg_pitch) > self.POSE_PITCH_DEG
+            yaw_penalty   = (yaw_n   / n_face) >= self.POSE_THRESHOLD
+            pitch_penalty = (pitch_n / n_face) >= self.POSE_THRESHOLD
             self._is_looking_away = yaw_penalty or pitch_penalty
 
             if yaw_penalty:

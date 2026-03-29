@@ -29,14 +29,24 @@ if [ $? -ne 0 ]; then
   "$PYTHON" -m pip install "mediapipe==0.10.14" --quiet
 fi
 
+# ── Guard: flask installed ────────────────────────────────────────────────────
+"$PYTHON" -c "import flask" 2>/dev/null || {
+  echo "Installing flask …"
+  "$PYTHON" -m pip install "flask>=3.0,<4.0" --quiet
+}
+
 echo ""
 echo "================================================="
-echo "  Heart CV-gnal  |  Affection / Interest Analyzer"
-echo "  Press Q or ESC inside the window to quit."
+echo "  Heart CV-gnal  ♥  Web UI Edition"
+echo "  Opening → http://localhost:5001"
+echo "  Press Ctrl+C here to quit."
 echo "================================================="
 echo ""
 
-PYTHONPATH="$SCRIPT_DIR/src" "$PYTHON" "$SCRIPT_DIR/apps/run_heart_cvgnal.py"
+# Open browser after a short delay (server needs a moment to start)
+sleep 1.5 && open "http://localhost:5001" &
+
+PYTHONPATH="$SCRIPT_DIR/src" "$PYTHON" "$SCRIPT_DIR/app.py"
 EXIT_CODE=$?
 
 echo ""

@@ -11,7 +11,9 @@ mouth_ratio      : mouth_width  / cheek_width
 eye_ratio        : avg_eye_height / cheek_width
 shoulder_ratio   : normalised shoulder-to-shoulder distance (proxy for lean-in)
 roll_angle_deg   : arctan(Δy / Δx) of the eye-corner line  (head tilt)
-nose_y           : normalised nose-tip y — used externally as a head-pitch proxy
+nose_y           : normalised nose-tip y — kept for legacy compatibility
+yaw_deg          : head yaw angle in degrees from solvePnP (left/right turn)
+pitch_deg        : head pitch angle in degrees from solvePnP (up/down tilt)
 wrists_crossed   : True when each wrist passes the opposite shoulder x-position
 """
 
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 
@@ -39,6 +42,29 @@ _R_EYE_LO  = 374   # right eye lower eyelid
 _EYE_L_OUT = 33    # left eye outer corner  (roll anchor A)
 _EYE_R_OUT = 263   # right eye outer corner (roll anchor B)
 _NOSE_TIP  = 4     # nose tip (head-pitch / nodding proxy)
+
+# ---------------------------------------------------------------------------
+# Head-pose solvePnP landmark indices  (6-point subset of FaceMesh)
+# ---------------------------------------------------------------------------
+_HP_NOSE_TIP  = 1    # nose bridge tip  (slightly above _NOSE_TIP for stability)
+_HP_CHIN      = 152  # chin bottom
+_HP_EYE_L_OUT = 33   # left  eye outer corner
+_HP_EYE_R_OUT = 263  # right eye outer corner
+_HP_MOUTH_L   = 61   # left  mouth corner
+_HP_MOUTH_R   = 291  # right mouth corner
+
+# Generic 3-D face model in mm (standard academic reference geometry)
+# Origin = nose tip; face looks toward -Z.
+_MODEL_3D = np.array([
+    [  0.0,    0.0,    0.0],   # nose tip
+    [  0.0, -330.0,  -65.0],   # chin
+    [-225.0,  170.0, -135.0],   # left  eye outer corner
+    [ 225.0,  170.0, -135.0],   # right eye outer corner
+    [-150.0, -150.0, -125.0],   # left  mouth corner
+    [ 150.0, -150.0, -125.0],   # right mouth corner
+], dtype=np.float64)
+
+_DIST_COEFFS = np.zeros((4, 1), dtype=np.float64)   # assume no lens distortion
 
 # ---------------------------------------------------------------------------
 # Pose landmark indices  (MediaPipe 33-point model)
@@ -74,8 +100,17 @@ class FrameFeatures:
     Positive = head tilted toward person's right; negative = toward left."""
 
     nose_y: float = 0.5
-    """Normalised nose-tip y coordinate [0 = top, 1 = bottom].
-    Used externally to detect head-nodding via variance over time."""
+    """Normalised nose-tip y coordinate [0 = top, 1 = bottom]."""
+
+    yaw_deg: float = 0.0
+    """Head yaw angle in degrees from solvePnP.
+    Positive = face turned to its right; negative = face turned to its left.
+    Absolute value > ~20° means the subject is looking away horizontally."""
+
+    pitch_deg: float = 0.0
+    """Head pitch angle in degrees from solvePnP.
+    Positive = face tilted up; negative = face tilted down.
+    Absolute value > ~15° means the subject is looking away vertically."""
 
     # ── Pose signals (from Pose landmarks via Holistic) ────────────────────
     shoulder_ratio: float = 0.0
@@ -105,16 +140,25 @@ class FeatureExtractor:
         features  = extractor.extract(holistic_results)
     """
 
-    def extract(self, holistic_results) -> FrameFeatures:
+    def extract(
+        self,
+        holistic_results,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> FrameFeatures:
         """
         Args:
             holistic_results: The object returned by
                 ``mp.solutions.holistic.Holistic.process(image_rgb)``.
+            frame_w: Frame pixel width  (used for solvePnP camera matrix).
+            frame_h: Frame pixel height (used for solvePnP camera matrix).
         Returns:
             FrameFeatures populated with as many values as the landmarks allow.
         """
         feats = FrameFeatures()
-        feats.face_detected = self._extract_face(holistic_results.face_landmarks, feats)
+        feats.face_detected = self._extract_face(
+            holistic_results.face_landmarks, feats, frame_w, frame_h
+        )
         feats.pose_detected = self._extract_pose(holistic_results.pose_landmarks, feats)
         return feats
 
@@ -122,7 +166,13 @@ class FeatureExtractor:
     # Private — face extraction
     # ------------------------------------------------------------------
 
-    def _extract_face(self, face_lm, out: FrameFeatures) -> bool:
+    def _extract_face(
+        self,
+        face_lm,
+        out: FrameFeatures,
+        frame_w: int,
+        frame_h: int,
+    ) -> bool:
         if face_lm is None or len(face_lm.landmark) < 468:
             return False
 
@@ -142,17 +192,68 @@ class FeatureExtractor:
         out.eye_ratio = ((l_h + r_h) / 2.0) / cheek_w
 
         # ── Roll Angle ───────────────────────────────────────────────────
-        # Vector from left eye outer-corner → right eye outer-corner.
-        # In the mirrored, processed frame: _EYE_L_OUT (33) is on the LEFT
-        # and _EYE_R_OUT (263) is on the RIGHT, so dx is typically positive.
         dx = lm[_EYE_R_OUT].x - lm[_EYE_L_OUT].x
         dy = lm[_EYE_R_OUT].y - lm[_EYE_L_OUT].y
         out.roll_angle_deg = float(np.degrees(np.arctan2(dy, dx)))
 
-        # ── Nose y (head-pitch proxy) ────────────────────────────────────
+        # ── Nose y ───────────────────────────────────────────────────────
         out.nose_y = float(lm[_NOSE_TIP].y)
 
+        # ── Head Pose: Yaw & Pitch via solvePnP ─────────────────────────
+        self._compute_head_pose(lm, out, frame_w, frame_h)
+
         return True
+
+    # ------------------------------------------------------------------
+    # Private — stable head pose via solvePnP + RQDecomp3x3
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_head_pose(
+        lm,
+        out: FrameFeatures,
+        frame_w: int,
+        frame_h: int,
+    ) -> None:
+        """
+        Estimate Yaw and Pitch from 6 FaceMesh landmarks using solvePnP.
+
+        The focal length is approximated as frame_w (a reasonable heuristic
+        for a typical webcam with a ~60° horizontal FOV).  No distortion is
+        assumed.  Euler angles are extracted via RQDecomp3x3 which decomposes
+        the rotation matrix stably into pitch (X), yaw (Y), roll (Z).
+        """
+        focal = float(frame_w)
+        cx    = frame_w / 2.0
+        cy    = frame_h / 2.0
+        cam_matrix = np.array(
+            [[focal, 0.0,   cx ],
+             [0.0,   focal, cy ],
+             [0.0,   0.0,   1.0]],
+            dtype=np.float64,
+        )
+
+        pts_2d = np.array([
+            [lm[_HP_NOSE_TIP ].x * frame_w, lm[_HP_NOSE_TIP ].y * frame_h],
+            [lm[_HP_CHIN     ].x * frame_w, lm[_HP_CHIN     ].y * frame_h],
+            [lm[_HP_EYE_L_OUT].x * frame_w, lm[_HP_EYE_L_OUT].y * frame_h],
+            [lm[_HP_EYE_R_OUT].x * frame_w, lm[_HP_EYE_R_OUT].y * frame_h],
+            [lm[_HP_MOUTH_L  ].x * frame_w, lm[_HP_MOUTH_L  ].y * frame_h],
+            [lm[_HP_MOUTH_R  ].x * frame_w, lm[_HP_MOUTH_R  ].y * frame_h],
+        ], dtype=np.float64)
+
+        success, rvec, _tvec = cv2.solvePnP(
+            _MODEL_3D, pts_2d, cam_matrix, _DIST_COEFFS,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not success:
+            return
+
+        rmat, _ = cv2.Rodrigues(rvec)
+        # RQDecomp3x3 returns angles in degrees: [pitch(X), yaw(Y), roll(Z)]
+        angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+        out.pitch_deg = float(angles[0])
+        out.yaw_deg   = float(angles[1])
 
     # ------------------------------------------------------------------
     # Private — pose extraction

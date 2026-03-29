@@ -30,7 +30,7 @@ from heart_cvgnal.pipelines.vision.feature_extractor import FeatureExtractor
 from heart_cvgnal.pipelines.vision.vlm_analyzer import VLMAnalyzer
 
 # ── Demo config (mirrors runner.py) ─────────────────────────────────────────
-_DEMO_DURATION = 300.0   # 5 minutes
+_DEMO_DURATION = 180.0   # 3 minutes
 _EVAL_WINDOW   = 5.0     # seconds per scoring window
 _CAMERA_INDEX  = 1   # 0 = 맥 내장, 1 = 아이폰 Continuity Camera
 
@@ -68,7 +68,7 @@ _frame_lock = threading.Lock()
 _state: dict = {
     "score":           50,
     "mood":            "Warming Up",
-    "time_left":       "05:00",
+    "time_left":       "03:00",
     "event_message":   "",
     "event_id":        0,      # increments on each new distinct event
     "eval_progress":   0,      # 0-100 % of current 5-s window elapsed
@@ -228,7 +228,7 @@ def _cv_loop(camera_index: int = _CAMERA_INDEX) -> None:
                     if window_start is not None else 0
                 )
             else:
-                time_str  = "05:00"
+                time_str  = "03:00"
                 eval_pct  = 0
 
             # ── Minimal visual overlays on the streamed frame ─────────────
